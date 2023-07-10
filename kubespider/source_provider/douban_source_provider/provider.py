@@ -93,4 +93,3 @@ class DoubanSourceProvider(provider.SourceProvider):
     def load_config(self) -> None:
         cfg = self.config_reader.read()
         self.sub_link = cfg.get("sub_link", "")
-        self.jackett_endpoint = cfg.get("jackett_endpoint", "")
