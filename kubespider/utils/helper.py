@@ -1,10 +1,11 @@
+import cgi
 import functools
-import uuid
 import hashlib
 import logging
-import cgi
 import os
+import re
 import time
+import uuid
 from urllib.parse import urlparse
 
 import requests
@@ -135,3 +136,8 @@ def retry(attempt_times=3, delay=1, exception=Exception):
         return retry_handle
 
     return decorator
+
+
+def extract_urls(text):
+    urls = re.findall('http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', text)
+    return urls
