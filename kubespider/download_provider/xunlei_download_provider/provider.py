@@ -1,16 +1,20 @@
 # This code is quite ugly becase the logic in xunlei is disgusting.
 # encoding:utf-8
 import logging
+import re
 import time
 import json
 
 import hashlib
 import base64
+from urllib.parse import quote
+
 import execjs
 import bencodepy
 
 from utils.config_reader import AbsConfigReader
 from utils.helper import get_request_controller
+from utils.version_parser import check_version_at_lest
 from download_provider import provider
 from api.values import Task
 
@@ -21,7 +25,9 @@ class XunleiDownloadProvider(provider.DownloadProvider):
         self.provider_name = name
         self.provider_type = 'xunlei_download_provider'
         self.http_endpoint = ''
-        self.device_id = ''
+        self._device_id = None
+        self._token_str = None
+        self._token_time = 0
         self.js_ctx = execjs.compile('')
         self.request_handler = get_request_controller(use_proxy=False)
 
@@ -47,6 +53,16 @@ class XunleiDownloadProvider(provider.DownloadProvider):
         file_info = self.list_files(token, magnet_url)
         return self.send_task(token, file_info, magnet_url, task.path)
 
+    def device_id(self, url_encode: bool = False):
+        if self._device_id is None:
+            info_watch = "/webman/3rdparty/pan-xunlei-com/index.cgi/device/info/watch"
+            token = self.get_pan_token()
+            req = self.request_handler.post(self.http_endpoint + info_watch,
+                                            headers={'pan-auth': token}, timeout=30)
+            self._device_id = str(json.loads(req.text).get("target"))
+            logging.info('Get xunlei device_id: %s', self._device_id)
+        return self._device_id if not url_encode else quote(self._device_id)
+
     def send_magnet_task(self, task: Task) -> TypeError:
         logging.info('Start magnet download:%s', task.url)
         token = self.get_pan_token()
@@ -70,11 +86,13 @@ class XunleiDownloadProvider(provider.DownloadProvider):
     def load_config(self) -> TypeError:
         cfg = self.config_reader.read()
         self.http_endpoint = cfg.get('http_endpoint', 'http://127.0.0.1:2345')
-        token_js_path = cfg.get('token_js_path', '/app/.config/dependencies/xunlei_download_provider/get_token.js')
-        with open(token_js_path, 'r', encoding='utf-8') as js_file:
-            js_text = js_file.read()
-        self.js_ctx = execjs.compile(js_text)
-        self.device_id = cfg.get('device_id', '')
+        try:
+            token_js_path = cfg.get('token_js_path', '/app/.config/dependencies/xunlei_download_provider/get_token.js')
+            with open(token_js_path, 'r', encoding='utf-8') as js_file:
+                js_text = js_file.read()
+            self.js_ctx = execjs.compile(js_text)
+        except Exception as err:
+            logging.error("Cannot read .config/dependencies/xunlei_download_provider/get_token.js: %s", err)
 
     def list_files(self, token: str, url: str) -> dict:
         try:
@@ -101,9 +119,9 @@ class XunleiDownloadProvider(provider.DownloadProvider):
                 "name": file_info['list']['resources'][0]['name'],
                 "file_name": file_info['list']['resources'][0]['name'],
                 "file_size": str(file_size),
-                "space": "device_id#" + self.device_id,
+                "space": self.device_id(),
                 "params": {
-                    "target": "device_id#" + self.device_id,
+                    "target": self.device_id(),
                     "url": url,
                     "total_file_count": str(file_info['list']['resources'][0]['file_count']),
                     "sub_file_index": str(self.get_file_index(file_info)),
@@ -139,7 +157,7 @@ class XunleiDownloadProvider(provider.DownloadProvider):
             data = {
                 "parent_id": parent_id,
                 "name": dir_name,
-                "space": "device_id#" + self.device_id,
+                "space": self.device_id(),
                 "kind": "drive#folder"
             }
             rep = self.request_handler.post(self.http_endpoint + path, headers={'pan-auth': token}, timeout=30,
@@ -160,9 +178,10 @@ class XunleiDownloadProvider(provider.DownloadProvider):
             while 1:
                 if len(dir_list) == cnt:
                     return parent_id
-                file_path = '/webman/3rdparty/pan-xunlei-com/index.cgi/drive/v1/files?space=device_id%23' + \
-                            self.device_id + '&limit=200&filters=%7B%22kind%22%3A%7B%22eq%22%3A%22drive%23folder%22%7D%7D&page_token=&' + \
-                            'pan_auth=' + token + '&device_space=&parent_id=' + parent_id
+                file_path = ('/webman/3rdparty/pan-xunlei-com/index.cgi/drive/v1/files?space=' +
+                             self.device_id(url_encode=True) + '&limit=200&' +
+                             'filters=%7B%22kind%22%3A%7B%22eq%22%3A%22drive%23folder%22%7D%7D&page_token=&' +
+                             'pan_auth=' + token + '&device_space=&parent_id=' + parent_id)
                 rep = self.request_handler.get(self.http_endpoint + file_path, headers={'pan-auth': token}, timeout=30)
                 if rep.status_code != 200:
                     raise Exception('Get files id error:' + rep.text)
@@ -192,6 +211,15 @@ class XunleiDownloadProvider(provider.DownloadProvider):
             logging.error("get path id error:%s", err)
             return ""
 
+    def get_server_version(self) -> str:
+        try:
+            rep = self.request_handler.get(self.http_endpoint + '/webman/3rdparty/pan-xunlei-com/index.cgi/launcher/status',
+                                           timeout=30)
+            return str(json.loads(rep.text).get('running_version'))
+        except Exception as err:
+            logging.error("get xunlei server version error:%s", err)
+            return ""
+
     def get_file_index(self, file_info: dict) -> str:
         file_count = int(file_info['list']['resources'][0]['file_count'])
         if file_count == 1:
@@ -199,6 +227,21 @@ class XunleiDownloadProvider(provider.DownloadProvider):
         return '0-' + str(file_count - 1)
 
     def get_pan_token(self) -> str:
+        server_version = self.get_server_version()
+        if check_version_at_lest(server_version, "3.21.0"):
+            if self._token_str is not None and self._token_time + 600 > int(time.time()):
+                return self._token_str
+            resp = self.request_handler.get(self.http_endpoint + '/webman/3rdparty/pan-xunlei-com/index.cgi/',
+                                           timeout=30)
+            uiauth = r'function uiauth\(value\){ return "(.*)" }'
+            for script in re.findall(uiauth, resp.text):
+                self._token_str = script
+                self._token_time = int(time.time())
+                logging.info('Get xunlei token from html:%s', self._token_str)
+                return self._token_str
+            logging.error('Get xunlei token from html error')
+            return ""
+
         xunlei_e = int(time.time())
         xunlei_cn = int(time.time())
         try:
